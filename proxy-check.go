@@ -1,303 +1,339 @@
 package main
 
 import (
-	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"math/rand"
+	"log"
+	"net"
 	"net/http"
 	URL "net/url"
 	"os"
-	"regexp"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/k0kubun/go-ansi"
 	"github.com/mmpx12/optionparser"
-	"github.com/schollz/progressbar/v3"
+	"golang.org/x/net/proxy"
 )
 
-var (
-	Proxies    []string
-	mu         = &sync.Mutex{}
-	valid      []string
-	checkmax   bool
-	counter    int32
-	maxvalid   int
-	disableBar bool
-	noProto    bool
-	delete     bool
-	file       string
-	version    = "1.1.3"
+const version = "2.0.0"
+
+const (
+	defaultTargetURL    = "http://checkip.amazonaws.com"
+	defaultListenAddr   = ":8080"
+	defaultTimeoutSec   = 3
+	defaultConcurrency  = 50
+	defaultMaxProxies   = 1000
+	maxRequestBodyBytes = 1 << 20
 )
 
-func ProxyTest(client *http.Client, proxy, urlTarget, timeout string) bool {
-	timeouts, _ := strconv.Atoi(timeout)
-	ctx, cncl := context.WithTimeout(context.Background(), time.Second*time.Duration(timeouts))
-	defer cncl()
-	proxyURL, _ := URL.Parse(proxy)
-	client = &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyURL(proxyURL),
-		},
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", urlTarget, nil)
-	req.Header.Add("User-Agent", "Mozilla/5.0 (X11; Linux x86_64)")
-	resp, err := client.Do(req)
-
-	if resp != nil {
-		defer resp.Body.Close()
-	}
-	if err != nil {
-		if disableBar {
-			fmt.Println("\033[31m[X] ", proxy, "\033[0m")
-		}
-		return false
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		if disableBar {
-			fmt.Println("\033[31m[X] ", proxy, "\033[0m")
-		}
-		return false
-	}
-	if disableBar {
-		fmt.Println("\033[32m[√] ", proxy, "\033[0m")
-	}
-	mu.Lock()
-	valid = append(valid, proxy)
-	mu.Unlock()
-	return true
+type CheckRequest struct {
+	Proxies     []string `json:"proxies"`
+	TargetURL   string   `json:"target_url"`
+	TimeoutSec  int      `json:"timeout_sec"`
+	Concurrency int      `json:"concurrency"`
 }
 
-func readLines(http, socks4, socks5, all bool) {
-	file, err := os.Open(file)
-	if err != nil {
-		print(err.Error(), "\n")
-		os.Exit(1)
-	}
-	defer file.Close()
-	scanner := bufio.NewScanner(file)
-	var proto = []string{"http://", "socks4://", "socks5://"}
-	for scanner.Scan() {
-		if strings.HasPrefix(scanner.Text(), "http://") {
-			if http == true || all == true {
-				Proxies = append(Proxies, scanner.Text())
-			}
-		} else if strings.HasPrefix(scanner.Text(), "socks4://") {
-			if socks4 == true || all == true {
-				Proxies = append(Proxies, scanner.Text())
-			}
-		} else if strings.HasPrefix(scanner.Text(), "socks5://") {
-			if socks5 == true || all == true {
-				Proxies = append(Proxies, scanner.Text())
-			}
-		} else if noProto {
-			var ipv4 = regexp.MustCompile(`^(((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.|$|:[0-9]{1,5})){4})`)
-			if ipv4.MatchString(scanner.Text()) {
-				proxy := scanner.Text()
-				for _, i := range proto {
-					Proxies = append(Proxies, i+proxy)
-				}
-			}
-		}
-	}
+type ProxyCheckResult struct {
+	Proxy       string `json:"proxy"`
+	Available   bool   `json:"available"`
+	StatusCode  int    `json:"status_code,omitempty"`
+	Error       string `json:"error,omitempty"`
+	DurationMS  int64  `json:"duration_ms"`
+	ProxyScheme string `json:"proxy_scheme"`
 }
 
-func writeResult(output, file string) {
-	if output != "" {
-		ff, _ := os.OpenFile(output, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
-		defer ff.Close()
-		for _, i := range valid {
-			fmt.Fprintln(ff, i)
-		}
-	}
+type CheckResponse struct {
+	TargetURL   string             `json:"target_url"`
+	Total       int                `json:"total"`
+	Available   int                `json:"available"`
+	Unavailable int                `json:"unavailable"`
+	Results     []ProxyCheckResult `json:"results"`
+}
 
-	if delete {
-		os.Remove(file)
-	}
+type healthResponse struct {
+	OK      bool   `json:"ok"`
+	Version string `json:"version"`
 }
 
 func main() {
-	var nologo, socks5, socks4, httpp, all, random, github, printversion bool
-	var url, goroutine, timeout, urlfile, output, nbrvalid string
+	var serverMode bool
+	var listenAddr string
+	var printVersion bool
+
 	op := optionparser.NewOptionParser()
-	op.Banner = "Proxy tester\n\nUsage:\n"
-	op.On("-s", "--socks4", "Test socks4 proxies", &socks4)
-	op.On("-S", "--socks5", "Test socks5 proxies", &socks5)
-	op.On("-H", "--http", "Test http proxies", &httpp)
-	op.On("-r", "--randomize-file", "Shuffle proxies files", &random)
-	op.On("-t", "--thread NBR", "Number of threads", &goroutine)
-	op.On("-T", "--timeout SEC", "Set timeout (seconds)", &timeout)
-	op.On("-u", "--url TARGET", "set URL for testing proxies", &url)
-	op.On("-f", "--proxies-file FILE", "files with proxies (proto://ip:port)", &file)
-	op.On("-m", "--max-valid NBR", "Stop when NBR valid proxies are found", &nbrvalid)
-	op.On("-i", "--ip", "Test all proto if no proto is specified in input", &noProto)
-	op.On("-U", "--proxies-url URL", "url with proxies file", &urlfile)
-	op.On("-p", "--dis-progressbar", "Disable progress bar", &disableBar)
-	op.On("-g", "--github", "use github.com/mmpx12/proxy-list", &github)
-	op.On("-o", "--output FILE", "File to write valid proxies", &output)
-	op.On("-v", "--version", "Print version and exit", &printversion)
-	op.Exemple("proxy-check -r -m 30 --socks5 -o valid-socks5.txt  -g")
-	op.Exemple("proxy-check -m 30 -o valid.txt -U 'https://raw.githubusercontent.com/mmpx12/proxy-list/master/proxies.txt'")
-	op.Exemple("proxy-check -u ipinfo.io -T 6 /path/to/proxy")
+	op.Banner = "Proxy checker service\n\nUsage:\n"
+	op.On("-s", "--server", "Run as HTTP service", &serverMode)
+	op.On("-l", "--listen ADDR", "HTTP listen address", &listenAddr)
+	op.On("-v", "--version", "Print version and exit", &printVersion)
 	err := op.Parse()
 	if err != nil {
-		print(err.Error(), "\n")
+		fmt.Println(err.Error())
 		os.Exit(1)
 	}
-	op.Logo("Proxy-check", "smslant", nologo)
 
-	if printversion {
+	if printVersion {
 		fmt.Println("version:", version)
-		os.Exit(1)
+		return
 	}
 
-	if err != nil || len(os.Args) == 1 {
+	if !serverMode {
 		op.Help()
-		os.Exit(1)
+		return
 	}
 
-	if nbrvalid != "" {
-		maxvalid, _ = strconv.Atoi(nbrvalid)
-		checkmax = true
-	} else {
-		maxvalid = 0
+	if listenAddr == "" {
+		listenAddr = defaultListenAddr
 	}
 
-	opts := strings.Join(strings.Fields(strings.TrimSpace(strings.Join(op.Extra, ""))), " ")
-	if (opts != "" || !github || urlfile == "") && file == "" {
-		file = opts
-	} else if file == "" {
-		fmt.Println("Error: Need file or url with proxies")
-		os.Exit(1)
+	server := newHTTPServer()
+	log.Printf("proxy-check service listening on %s", listenAddr)
+	if err := http.ListenAndServe(listenAddr, server); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func newHTTPServer() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", handleHealth)
+	mux.HandleFunc("/check", handleCheck)
+	return mux
+}
+
+func handleHealth(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, healthResponse{OK: true, Version: version})
+}
+
+func handleCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
 	}
 
-	if github {
-		delete = true
-		urlfile = "https://raw.githubusercontent.com/mmpx12/proxy-list/master/proxies.txt"
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	defer r.Body.Close()
+
+	var req CheckRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
 	}
 
-	if urlfile != "" {
-		if !strings.Contains(urlfile, "http://") && !strings.Contains(urlfile, "https://") {
-			urlfile = "http://" + urlfile
-		}
-		delete = true
-		b := make([]byte, 5)
-		rand.Seed(time.Now().UnixNano())
-		rand.Read(b)
-		file = fmt.Sprintf("proxies-%x.txt", b)
-		r, err := http.Get(urlfile)
-		if err != nil {
-			print(err.Error(), "\n")
-			os.Exit(1)
-		}
-		defer r.Body.Close()
-		f, _ := os.Create(file)
-		defer f.Close()
-		r.Write(f)
+	resp, err := checkProxies(r.Context(), req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
-	if !httpp && !socks4 && !socks5 {
-		all = true
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func checkProxies(ctx context.Context, req CheckRequest) (*CheckResponse, error) {
+	proxies := normalizeProxies(req.Proxies)
+	if len(proxies) == 0 {
+		return nil, errors.New("proxies is required")
+	}
+	if len(proxies) > defaultMaxProxies {
+		return nil, fmt.Errorf("too many proxies: max %d", defaultMaxProxies)
 	}
 
-	if url == "" {
-		url = "http://checkip.amazonaws.com"
-	} else if !strings.Contains(url, "http://") && !strings.Contains(url, "https://") {
-		url = "http://" + url
+	targetURL := strings.TrimSpace(req.TargetURL)
+	if targetURL == "" {
+		targetURL = defaultTargetURL
+	}
+	parsedTarget, err := normalizeTargetURL(targetURL)
+	if err != nil {
+		return nil, err
 	}
 
-	if timeout == "" {
-		timeout = "3"
+	timeoutSec := req.TimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = defaultTimeoutSec
 	}
 
-	if goroutine == "" {
-		goroutine = "50"
+	concurrency := req.Concurrency
+	if concurrency <= 0 {
+		concurrency = defaultConcurrency
+	}
+	if concurrency > len(proxies) {
+		concurrency = len(proxies)
 	}
 
-	var wg = sync.WaitGroup{}
-	goroutines, _ := strconv.Atoi(goroutine)
-	maxGoroutines := goroutines
-	guard := make(chan struct{}, maxGoroutines)
-	readLines(httpp, socks4, socks5, all)
+	results := make([]ProxyCheckResult, len(proxies))
+	guard := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
 
-	if random {
-		rand.Seed(time.Now().UnixNano())
-		rand.Shuffle(len(Proxies),
-			func(i, j int) {
-				Proxies[i], Proxies[j] = Proxies[j], Proxies[i]
-			})
-	}
-
-	var size int
-	if maxvalid > 0 {
-		size = maxvalid
-	} else {
-		size = len(Proxies)
-	}
-	bar := progressbar.NewOptions(size,
-		progressbar.OptionSetWriter(ansi.NewAnsiStdout()),
-		progressbar.OptionEnableColorCodes(true),
-		progressbar.OptionSetPredictTime(false),
-		progressbar.OptionClearOnFinish(),
-		progressbar.OptionSetVisibility(!disableBar),
-		progressbar.OptionSetDescription("[green]"+strconv.Itoa(int(counter))),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "[green]━[reset]",
-			SaucerHead:    "[green][dark_gray]",
-			SaucerPadding: "━",
-			BarStart:      "[light_gray][[dark_gray]",
-			BarEnd:        "[light_gray]][reset]",
-		}))
-
-	var client *http.Client
-	for i, j := range Proxies {
-
-		bar.Describe("[green]" + strconv.Itoa(int(counter)) + "[light_gray]|[red]" + strconv.Itoa(i-int(counter)) + "[light_gray]|[yellow]" + strconv.Itoa(size) + "[reset]")
-		mu.Lock()
-		if checkmax && counter >= int32(maxvalid) {
-			writeResult(output, file)
-			bar.Finish()
-			fmt.Println()
-			fmt.Println("\033[4mValid proxies:\033[0m\n")
-			for _, v := range valid {
-				fmt.Println(v)
-			}
-			if delete {
-				os.Remove(file)
-			}
-			os.Exit(0)
-		}
-		mu.Unlock()
+	for i, proxyAddress := range proxies {
 		guard <- struct{}{}
 		wg.Add(1)
-		go func() {
+		go func(index int, proxyAddress string) {
 			defer wg.Done()
-			var res bool
-			res = ProxyTest(client, j, url, timeout)
-			if res == true {
-				mu.Lock()
-				bar.Add(1)
-				atomic.AddInt32(&counter, 1)
-				mu.Unlock()
-			}
-			<-guard
-		}()
+			defer func() { <-guard }()
+			results[index] = testProxy(ctx, proxyAddress, parsedTarget, timeoutSec)
+		}(i, proxyAddress)
 	}
+
 	wg.Wait()
-	bar.Finish()
-	writeResult(output, file)
-	fmt.Println()
-	fmt.Println("\033[4mValid proxies:\033[0m\n")
-	for _, v := range valid {
-		fmt.Println(v)
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Proxy < results[j].Proxy
+	})
+
+	available := 0
+	for _, result := range results {
+		if result.Available {
+			available++
+		}
 	}
-	if delete {
-		os.Remove(file)
+
+	return &CheckResponse{
+		TargetURL:   parsedTarget,
+		Total:       len(results),
+		Available:   available,
+		Unavailable: len(results) - available,
+		Results:     results,
+	}, nil
+}
+
+func testProxy(parent context.Context, proxyAddress, targetURL string, timeoutSec int) ProxyCheckResult {
+	startedAt := time.Now()
+	result := ProxyCheckResult{Proxy: proxyAddress}
+
+	proxyURL, err := URL.Parse(proxyAddress)
+	if err != nil {
+		result.Error = "invalid proxy url"
+		result.DurationMS = time.Since(startedAt).Milliseconds()
+		return result
 	}
+
+	scheme := strings.ToLower(proxyURL.Scheme)
+	result.ProxyScheme = scheme
+	if scheme != "http" && scheme != "socks5" {
+		result.Error = "unsupported proxy scheme"
+		result.DurationMS = time.Since(startedAt).Milliseconds()
+		return result
+	}
+
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	transport, err := buildTransport(proxyURL)
+	if err != nil {
+		result.Error = err.Error()
+		result.DurationMS = time.Since(startedAt).Milliseconds()
+		return result
+	}
+
+	client := &http.Client{Transport: transport}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		result.Error = "failed to create request"
+		result.DurationMS = time.Since(startedAt).Milliseconds()
+		return result
+	}
+	req.Header.Set("User-Agent", "proxy-check-service/2.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		result.Error = err.Error()
+		result.DurationMS = time.Since(startedAt).Milliseconds()
+		return result
+	}
+	defer resp.Body.Close()
+
+	result.StatusCode = resp.StatusCode
+	result.Available = resp.StatusCode == http.StatusOK
+	if !result.Available {
+		result.Error = fmt.Sprintf("unexpected status code: %d", resp.StatusCode)
+	}
+	result.DurationMS = time.Since(startedAt).Milliseconds()
+	return result
+}
+
+func buildTransport(proxyURL *URL.URL) (*http.Transport, error) {
+	baseTransport := &http.Transport{
+		Proxy:                 nil,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+	}
+
+	switch strings.ToLower(proxyURL.Scheme) {
+	case "http":
+		baseTransport.Proxy = http.ProxyURL(proxyURL)
+		return baseTransport, nil
+	case "socks5":
+		dialer, err := proxy.FromURL(proxyURL, &net.Dialer{Timeout: 10 * time.Second})
+		if err != nil {
+			return nil, fmt.Errorf("failed to build socks5 dialer: %w", err)
+		}
+		baseTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialWithContext(ctx, dialer, network, addr)
+		}
+		return baseTransport, nil
+	default:
+		return nil, errors.New("unsupported proxy scheme")
+	}
+}
+
+func dialWithContext(ctx context.Context, dialer proxy.Dialer, network, addr string) (net.Conn, error) {
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		conn, err := dialer.Dial(network, addr)
+		resultCh <- dialResult{conn: conn, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-resultCh:
+		return result.conn, result.err
+	}
+}
+
+func normalizeProxies(values []string) []string {
+	proxies := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		proxyAddress := strings.TrimSpace(value)
+		if proxyAddress == "" {
+			continue
+		}
+		if _, ok := seen[proxyAddress]; ok {
+			continue
+		}
+		seen[proxyAddress] = struct{}{}
+		proxies = append(proxies, proxyAddress)
+	}
+	return proxies
+}
+
+func normalizeTargetURL(raw string) (string, error) {
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		raw = "http://" + raw
+	}
+	parsed, err := URL.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return "", errors.New("invalid target_url")
+	}
+	return parsed.String(), nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
 }
