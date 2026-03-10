@@ -26,6 +26,38 @@ go mod tidy
 go build -o proxy-check
 ```
 
+## Docker 部署
+
+### 1. 构建镜像
+
+```bash
+docker build -t proxy-check:latest .
+```
+
+### 2. 运行容器
+
+```bash
+docker run -d --name proxy-check -p 8080:8080 proxy-check:latest
+```
+
+### 3. 验证服务
+
+```bash
+curl http://127.0.0.1:8080/healthz
+```
+
+### 4. 使用 Docker Compose
+
+```bash
+docker compose up -d --build
+```
+
+验证：
+
+```bash
+curl http://127.0.0.1:8080/healthz
+```
+
 ## 启动服务
 
 ```bash
