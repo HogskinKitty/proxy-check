@@ -1,0 +1,7 @@
+services:
+  proxy-check:
+    build: .
+    image: proxy-check:latest
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
