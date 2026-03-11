@@ -1,7 +1,6 @@
 services:
   proxy-check:
-    build: .
-    image: proxy-check:latest
+    image: ghcr.io/hogskinkitty/proxy-check:latest
     ports:
       - "8080:8080"
     restart: unless-stopped
