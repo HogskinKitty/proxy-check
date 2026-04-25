@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -89,18 +90,83 @@ func main() {
 		listenAddr = defaultListenAddr
 	}
 
-	server := newHTTPServer()
+	apiKey := loadAPIKeys()
+
+	server := newHTTPServer(apiKey)
 	log.Printf("proxy-check service listening on %s", listenAddr)
+	if apiKey != "" {
+		log.Printf("API key authentication enabled")
+	}
 	if err := http.ListenAndServe(listenAddr, server); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func newHTTPServer() http.Handler {
+func newHTTPServer(apiKey string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealth)
 	mux.HandleFunc("/check", handleCheck)
-	return mux
+	if apiKey == "" {
+		return mux
+	}
+	return authMiddleware(mux, apiKey)
+}
+
+func loadAPIKeys() string {
+	if v := os.Getenv("API_KEY"); v != "" {
+		return v
+	}
+	path := os.Getenv("API_KEY_FILE")
+	if path == "" {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		log.Fatalf("failed to open API_KEY_FILE %s: %v", path, err)
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1024), 1024)
+	var keys []string
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			keys = append(keys, line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Fatalf("failed to read API_KEY_FILE %s: %v", path, err)
+	}
+	return strings.Join(keys, ",")
+}
+
+func authMiddleware(next http.Handler, apiKey string) http.Handler {
+	validKeys := make(map[string]struct{})
+	for _, k := range strings.Split(apiKey, ",") {
+		k = strings.TrimSpace(k)
+		if k != "" {
+			validKeys[k] = struct{}{}
+		}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if _, ok := validKeys[token]; ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if key := r.Header.Get("X-API-Key"); key != "" {
+			if _, ok := validKeys[key]; ok {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+	})
 }
 
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -120,7 +186,7 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeError(w, http.StatusUnprocessableEntity, "invalid request body")
 		return
 	}
 
