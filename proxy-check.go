@@ -104,6 +104,7 @@ func main() {
 
 func newHTTPServer(apiKey string) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleHealth)
 	mux.HandleFunc("/healthz", handleHealth)
 	mux.HandleFunc("/check", handleCheck)
 	if apiKey == "" {
